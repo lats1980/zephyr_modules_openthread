@@ -16,18 +16,10 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_OPENTHREAD_L2_LOG_LEVEL);
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
-
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/net/ieee802154_radio.h>
 #include <zephyr/net/net_pkt.h>
-#include <zephyr/net/net_time.h>
-#include <zephyr/sys/__assert.h>
-
 #include <openthread/ip6.h>
 #include <openthread-system.h>
 #include <openthread/instance.h>
@@ -36,19 +28,15 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_OPENTHREAD_L2_LOG_LEVEL);
 #include <openthread/platform/time.h>
 #include <openthread/message.h>
 
-#include "platform-zephyr.h"
+#include <nrf_modem_dect_phy.h>
+#include <modem/nrf_modem_lib.h>
+#include <zephyr/drivers/hwinfo.h>
 
-#define SHORT_ADDRESS_SIZE 2
-
-#define FCS_SIZE     2
-#if defined(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)
-#define ACK_PKT_LENGTH 5
-#else
-#define ACK_PKT_LENGTH 127
-#endif
-
-#define FRAME_TYPE_MASK 0x07
-#define FRAME_TYPE_ACK 0x02
+#include <zephyr/random/random.h>
+#include <zephyr/net/net_pkt.h>
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_ip.h>
+#include <zephyr/net/openthread.h>
 
 #if defined(CONFIG_NET_TC_THREAD_COOPERATIVE)
 #define OT_WORKER_PRIORITY K_PRIO_COOP(CONFIG_OPENTHREAD_THREAD_PRIORITY)
@@ -56,14 +44,17 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_OPENTHREAD_L2_LOG_LEVEL);
 #define OT_WORKER_PRIORITY K_PRIO_PREEMPT(CONFIG_OPENTHREAD_THREAD_PRIORITY)
 #endif
 
-#define CHANNEL_COUNT OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX - OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN + 1
-
-/* PHY header duration in us (i.e. 2 symbol periods @ 62.5k symbol rate), see
- * IEEE 802.15.4, sections 12.1.3.1, 12.2.5 and 12.3.3.
- */
-#define PHR_DURATION_US 32U
-
-#define DEFAULT_SENSITIVITY -100
+//sub GHz 915
+//#define DECT_CARRIER 538
+#define DECT_CARRIER			1677
+#define DECT_TX_HANDLE			0
+#define DECT_RX_HANDLE			1
+#define DEFAULT_SENSITIVITY		-105
+#define CONFIG_RSSI_TARGET		-90
+#define DECT_802154_RX_BUFFERS	16
+#define DECT_RX_STACK_SIZE		800
+#define OPENTHREAD_MTU			1280
+#define OT_PHR_LENGTH			2
 
 enum pending_events {
 	PENDING_EVENT_FRAME_TO_SEND, /* There is a tx frame to send  */
@@ -77,65 +68,98 @@ enum pending_events {
 	PENDING_EVENT_COUNT /* Keep last */
 };
 
-K_SEM_DEFINE(radio_sem, 0, 1);
+/* Header type 1, due to endianness the order is different than in the specification. */
+struct phy_ctrl_field_common {
+	uint32_t packet_length : 4;
+	uint32_t packet_length_type : 1;
+	uint32_t header_format : 3;
+	uint32_t short_network_id : 8;
+	uint32_t transmitter_id_hi : 8;
+	uint32_t transmitter_id_lo : 8;
+	uint32_t df_mcs : 3;
+	uint32_t reserved : 1;
+	uint32_t transmit_power : 4;
+	uint32_t pad : 24;
+};
 
-static otRadioState sState = OT_RADIO_STATE_DISABLED;
 
-static otRadioFrame sTransmitFrame;
-static otRadioFrame ack_frame;
-static uint8_t ack_psdu[ACK_PKT_LENGTH];
+K_SEM_DEFINE(radio_sem, 1, 1);
 
-#if defined(CONFIG_OPENTHREAD_TIME_SYNC)
-static otRadioIeInfo tx_ie_info;
-#endif
-
-static struct net_pkt *tx_pkt;
-static struct net_buf *tx_payload;
-
-static const struct device *const radio_dev =
-	DEVICE_DT_GET(DT_CHOSEN(zephyr_ieee802154));
-static struct ieee802154_radio_api *radio_api;
-
-/* Get the default tx output power from Kconfig */
-static int8_t tx_power = CONFIG_OPENTHREAD_DEFAULT_TX_POWER;
-static uint16_t channel;
-static bool promiscuous;
-
-static uint16_t energy_detection_time;
-static uint8_t energy_detection_channel;
-static int16_t energy_detected_value;
-
-static int8_t max_tx_power_table[CHANNEL_COUNT];
+/* Semaphore to synchronize modem calls. */
+K_SEM_DEFINE(operation_sem, 0, 1);
 
 ATOMIC_DEFINE(pending_events, PENDING_EVENT_COUNT);
+
 K_KERNEL_STACK_DEFINE(ot_task_stack,
 		      CONFIG_OPENTHREAD_RADIO_WORKQUEUE_STACK_SIZE);
-static struct k_work_q ot_work_q;
-static otError rx_result;
-static otError tx_result;
 
 K_FIFO_DEFINE(rx_pkt_fifo);
 K_FIFO_DEFINE(tx_pkt_fifo);
 
-static int8_t get_transmit_power_for_channel(uint8_t aChannel)
-{
-	int8_t channel_max_power = OT_RADIO_POWER_INVALID;
-	int8_t power = 0; /* 0 dbm as default value */
+static struct net_pkt *net_tx_pkt;
+static struct net_buf *net_tx_buf;
 
-	if (aChannel >= OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN &&
-	    aChannel <= OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX) {
-		channel_max_power =
-			max_tx_power_table[aChannel - OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN];
-	}
+/* TODO: enable OT_RADIO_CAPS_TRANSMIT_TIMING and use start_time to send frame in given time */
+/* TODO: enable OT_RADIO_CAPS_SLEEP_TO_TX for SED */
+/* TODO: disable OT_RADIO_CAPS_RX_ON_WHEN_IDLE for SED */
+static otRadioCaps ot_radio_caps = OT_RADIO_CAPS_RX_ON_WHEN_IDLE | OT_RADIO_CAPS_ENERGY_SCAN;
+static otRadioState ot_state = OT_RADIO_STATE_DISABLED;
+static otRadioFrame ot_transmit_frame;
+static otRadioFrame ot_ack_frame;
+static otPanId        ot_pan_id;
+static otExtAddress   ot_ext_addr;
+static otShortAddress ot_short_addr;
+static otError ot_tx_result;
+static otError ot_rx_result;
+static uint8_t ot_channel;
 
-	if (tx_power != OT_RADIO_POWER_INVALID) {
-		power = (channel_max_power < tx_power) ? channel_max_power : tx_power;
-	} else if (channel_max_power != OT_RADIO_POWER_INVALID) {
-		power = channel_max_power;
-	}
+static int8_t last_rssi = INT8_MAX;
+static int8_t tx_power = CONFIG_OPENTHREAD_DEFAULT_TX_POWER;
 
-	return power;
-}
+static uint16_t dect_device_id;
+static enum nrf_modem_dect_phy_err dect_op_result;
+
+static struct k_work_q ot_work_q;
+
+struct dect_802154_rx_frame {
+	void *fifo_reserved; /* 1st word reserved for use by fifo. */
+	uint64_t time; /* RX timestamp. */
+	uint8_t lqi; /* Last received frame LQI value. */
+	int8_t rssi; /* Last received frame RSSI value. */
+	bool ack_fpb; /* FPB value in ACK sent for the received frame. */
+	bool ack_seb; /* SEB value in ACK sent for the received frame. */
+	uint8_t rx_psdu[OT_PHR_LENGTH + OT_RADIO_FRAME_MAX_SIZE];
+};
+
+struct dectnr_ot_l2_ctx {
+	struct net_if *iface;
+	uint8_t eui64[8];
+
+	/* RX thread stack. */
+	K_KERNEL_STACK_MEMBER(rx_stack, DECT_RX_STACK_SIZE);
+
+	/* RX thread control block. */
+	struct k_thread rx_thread;
+
+	/* RX fifo queue. */
+	struct k_fifo rx_fifo;
+
+	/* Buffers for passing received frame pointers and data to the
+	 * RX thread via rx_fifo object.
+	 */
+	struct dect_802154_rx_frame rx_frames[DECT_802154_RX_BUFFERS];
+
+	/* Frame pending bit value in ACK sent for the last received frame. */
+	bool last_frame_ack_fpb;
+
+	/* Security Enabled bit value in ACK sent for the last received frame. */
+	bool last_frame_ack_seb;
+};
+
+static struct dectnr_ot_l2_ctx dectnr_l2_ctx;
+
+/* TX Buffer for DECT PHY transmition */
+static uint8_t dect_tx_psdu[OT_PHR_LENGTH + OT_RADIO_FRAME_MAX_SIZE];
 
 static inline bool is_pending_event_set(enum pending_events event)
 {
@@ -156,92 +180,6 @@ static void reset_pending_event(enum pending_events event)
 static inline void clear_pending_events(void)
 {
 	atomic_clear(pending_events);
-}
-
-void energy_detected(const struct device *dev, int16_t max_ed)
-{
-	if (dev == radio_dev) {
-		energy_detected_value = max_ed;
-		set_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
-	}
-}
-
-enum net_verdict ieee802154_handle_ack(struct net_if *iface, struct net_pkt *pkt)
-{
-	ARG_UNUSED(iface);
-
-	size_t ack_len = net_pkt_get_len(pkt);
-
-	if (ack_len > ACK_PKT_LENGTH) {
-		return NET_CONTINUE;
-	}
-
-	if ((*net_pkt_data(pkt) & FRAME_TYPE_MASK) != FRAME_TYPE_ACK) {
-		return NET_CONTINUE;
-	}
-
-	if (ack_frame.mLength != 0) {
-		LOG_ERR("Overwriting unhandled ACK frame.");
-	}
-
-	if (net_pkt_read(pkt, ack_psdu, ack_len) < 0) {
-		LOG_ERR("Failed to read ACK frame.");
-		return NET_CONTINUE;
-	}
-
-	ack_frame.mPsdu = ack_psdu;
-	ack_frame.mLength = ack_len;
-	ack_frame.mInfo.mRxInfo.mLqi = net_pkt_ieee802154_lqi(pkt);
-	ack_frame.mInfo.mRxInfo.mRssi = net_pkt_ieee802154_rssi_dbm(pkt);
-
-#if defined(CONFIG_NET_PKT_TIMESTAMP)
-	ack_frame.mInfo.mRxInfo.mTimestamp = net_pkt_timestamp_ns(pkt) / NSEC_PER_USEC;
-#endif
-
-	return NET_OK;
-}
-
-void handle_radio_event(const struct device *dev, enum ieee802154_event evt,
-			void *event_params)
-{
-	ARG_UNUSED(event_params);
-
-	switch (evt) {
-	case IEEE802154_EVENT_TX_STARTED:
-		if (sState == OT_RADIO_STATE_TRANSMIT) {
-			set_pending_event(PENDING_EVENT_TX_STARTED);
-		}
-		break;
-	case IEEE802154_EVENT_RX_FAILED:
-		if (sState == OT_RADIO_STATE_RECEIVE) {
-			switch (*(enum ieee802154_rx_fail_reason *) event_params) {
-			case IEEE802154_RX_FAIL_NOT_RECEIVED:
-				rx_result = OT_ERROR_NO_FRAME_RECEIVED;
-				break;
-
-			case IEEE802154_RX_FAIL_INVALID_FCS:
-				rx_result = OT_ERROR_FCS;
-				break;
-
-			case IEEE802154_RX_FAIL_ADDR_FILTERED:
-				rx_result = OT_ERROR_DESTINATION_ADDRESS_FILTERED;
-				break;
-
-			case IEEE802154_RX_FAIL_OTHER:
-			default:
-				rx_result = OT_ERROR_FAILED;
-				break;
-			}
-			set_pending_event(PENDING_EVENT_RX_FAILED);
-		}
-		break;
-	case IEEE802154_EVENT_RX_OFF:
-		set_pending_event(PENDING_EVENT_SLEEP);
-		break;
-	default:
-		/* do nothing - ignore event */
-		break;
-	}
 }
 
 #if defined(CONFIG_NET_PKT_TXTIME) || defined(CONFIG_OPENTHREAD_CSL_RECEIVER)
@@ -322,115 +260,459 @@ static net_time_t convert_32bit_us_wrapped_to_64bit_ns(uint32_t target_time_us_w
 }
 #endif /* CONFIG_NET_PKT_TXTIME || CONFIG_OPENTHREAD_CSL_RECEIVER */
 
-static void dataInit(void)
+/* Callback after init operation. */
+static void init(const uint64_t *time, int16_t temp, enum nrf_modem_dect_phy_err err,
+	  const struct nrf_modem_dect_phy_modem_cfg *cfg)
 {
-	tx_pkt = net_pkt_alloc(K_NO_WAIT);
-	__ASSERT_NO_MSG(tx_pkt != NULL);
+	if (err) {
+		LOG_ERR("DECT init operation failed, err %d", err);
+	}
+	dect_op_result = err;
+	k_sem_give(&operation_sem);
+}
 
-	tx_payload = net_pkt_get_reserve_tx_data(IEEE802154_MAX_PHY_PACKET_SIZE,
-						 K_NO_WAIT);
-	__ASSERT_NO_MSG(tx_payload != NULL);
+/* Callback after deinit operation. */
+static void deinit(const uint64_t *time, enum nrf_modem_dect_phy_err err)
+{
+	if (err) {
+		LOG_ERR("Deinit failed, err %d", err);
+		return;
+	}
+	k_sem_give(&operation_sem);
+}
 
-	net_pkt_append_buffer(tx_pkt, tx_payload);
+/* Operation complete notification. */
+static void op_complete(const uint64_t *time, int16_t temperature,
+		 enum nrf_modem_dect_phy_err err, uint32_t handle)
+{
+	if (err != 0)
+		LOG_INF("op_complete cb time %"PRIu64" handle: %d status %X ot_state: %d", *time, handle, err, ot_state);
+	if (handle == DECT_TX_HANDLE) {
+		if (ot_state == OT_RADIO_STATE_TRANSMIT) {
+			set_pending_event(PENDING_EVENT_TX_STARTED);
+		}
+		dect_op_result = err;
+		k_sem_give(&radio_sem);
+	}
+}
 
-	sTransmitFrame.mPsdu = tx_payload->data;
+/* Callback after receive stop operation. */
+static void rx_stop(const uint64_t *time, enum nrf_modem_dect_phy_err err, uint32_t handle)
+{
+	LOG_DBG("rx_stop cb time %"PRIu64" status %d handle %d", *time, err, handle);
+	k_sem_give(&radio_sem);
+}
 
-	for (size_t i = 0; i < CHANNEL_COUNT; i++) {
-		max_tx_power_table[i] = OT_RADIO_POWER_INVALID;
+/* Physical Control Channel reception notification. */
+static void pcc(
+	const uint64_t *time,
+	const struct nrf_modem_dect_phy_rx_pcc_status *status,
+	const union nrf_modem_dect_phy_hdr *hdr)
+{
+	struct phy_ctrl_field_common *header = (struct phy_ctrl_field_common *)hdr->type_1;
+
+	LOG_INF("Received header from device ID %d",
+		header->transmitter_id_hi << 8 |  header->transmitter_id_lo);
+}
+
+/* Physical Control Channel CRC error notification. */
+static void pcc_crc_err(const uint64_t *time,
+		 const struct nrf_modem_dect_phy_rx_pcc_crc_failure *crc_failure)
+{
+	LOG_DBG("pcc_crc_err cb time %"PRIu64"", *time);
+	ot_rx_result = OT_ERROR_FCS;
+	set_pending_event(PENDING_EVENT_RX_FAILED);
+}
+
+static void dect_rx_thread(void *arg1, void *arg2, void *arg3)
+{
+	struct net_pkt *pkt;
+	struct dect_802154_rx_frame *rx_frame;
+	uint16_t pkt_len;
+	//uint8_t *psdu;
+
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (1) {
+		pkt = NULL;
+		rx_frame = NULL;
+
+		rx_frame = k_fifo_get(&dectnr_l2_ctx.rx_fifo, K_FOREVER);
+
+		//pkt_len = rx_frame->rx_psdu[0];
+		pkt_len = *(uint16_t *)rx_frame->rx_psdu;
+
+#if defined(CONFIG_NET_BUF_DATA_SIZE)
+		__ASSERT_NO_MSG(pkt_len <= CONFIG_NET_BUF_DATA_SIZE);
+#endif
+
+		LOG_INF("Frame received: %d", pkt_len);
+
+		/* Block the RX thread until net_pkt is available, so that we
+		 * don't drop already ACKed frame in case of temporary net_pkt
+		 * scarcity. The nRF 802154 radio driver will accumulate any
+		 * incoming frames until it runs out of internal buffers (and
+		 * thus stops acknowledging consecutive frames).
+		 */
+		pkt = net_pkt_rx_alloc_with_buffer(dectnr_l2_ctx.iface, pkt_len,
+						   AF_UNSPEC, 0, K_FOREVER);
+
+		if (net_pkt_write(pkt, rx_frame->rx_psdu + OT_PHR_LENGTH, pkt_len)) {
+			goto drop;
+		}
+
+		net_pkt_set_ieee802154_lqi(pkt, rx_frame->lqi);
+		net_pkt_set_ieee802154_rssi_dbm(pkt, rx_frame->rssi);
+		net_pkt_set_ieee802154_ack_fpb(pkt, rx_frame->ack_fpb);
+
+#if defined(CONFIG_NET_PKT_TIMESTAMP)
+		net_pkt_set_timestamp_ns(pkt, rx_frame->time * NSEC_PER_USEC);
+#endif
+		net_pkt_set_ieee802154_ack_seb(pkt, rx_frame->ack_seb);
+
+		LOG_INF("Caught a packet (%u) (LQI: %u)",
+			 pkt_len, rx_frame->lqi);
+			LOG_HEXDUMP_DBG(rx_frame->rx_psdu + OT_PHR_LENGTH, pkt_len, "rx frame:");
+
+		if (net_recv_data(dectnr_l2_ctx.iface, pkt) < 0) {
+			LOG_ERR("Packet dropped by NET stack");
+			goto drop;
+		}
+
+		//rx_frame->rx_psdu[0] = 0;
+		*(uint16_t *)rx_frame->rx_psdu = 0;
+		continue;
+
+drop:
+		//rx_frame->rx_psdu[0] = 0;
+		*(uint16_t *)rx_frame->rx_psdu = 0;
+
+		net_pkt_unref(pkt);
+	}
+}
+
+/* Physical Data Channel reception notification. */
+static void pdc(const uint64_t *time,
+		const struct nrf_modem_dect_phy_rx_pdc_status *status,
+		const void *data, uint32_t len)
+{
+	uint16_t psdu_len;
+	int8_t power, lqi;
+
+	/* Received RSSI value is in fixed precision format Q14.1 */
+	LOG_INF("Received data (RSSI: %d.%d): %s",
+		(status->rssi_2 / 2), (status->rssi_2 & 0b1) * 5, (char *)data);
+	LOG_HEXDUMP_DBG(data, len, "pdc:");
+	if (status->snr >= 127) {
+		LOG_ERR("SNR Not known or not detectable.");
+		return;
+	}
+	psdu_len = *(uint16_t *)data;
+	power = (status->rssi_2) / 2;
+	lqi = status->snr;
+	for (uint32_t i = 0; i < ARRAY_SIZE(dectnr_l2_ctx.rx_frames); i++) {
+		//if (dectnr_l2_ctx.rx_frames[i].psdu != NULL) {
+		//if (dectnr_l2_ctx.rx_frames[i].rx_psdu[0] != 0) {
+		if (*(uint16_t *)dectnr_l2_ctx.rx_frames[i].rx_psdu != 0 ) {
+			continue;
 	}
 
-#if defined(CONFIG_OPENTHREAD_TIME_SYNC)
-	sTransmitFrame.mInfo.mTxInfo.mIeInfo = &tx_ie_info;
+		//dectnr_l2_ctx.rx_frames[i].psdu = data;
+		memcpy(dectnr_l2_ctx.rx_frames[i].rx_psdu, (uint8_t *)data, psdu_len + OT_PHR_LENGTH);
+		dectnr_l2_ctx.rx_frames[i].rssi = power;
+		last_rssi = power;
+		dectnr_l2_ctx.rx_frames[i].lqi = lqi;
+
+#if defined(CONFIG_NET_PKT_TIMESTAMP)
+#if 0
+		dectnr_l2_ctx.rx_frames[i].time =
+			nrf_802154_timestamp_end_to_phr_convert(time, data[0]);
+#else
+		dectnr_l2_ctx.rx_frames[i].time = 0;
 #endif
+#endif
+
+		dectnr_l2_ctx.rx_frames[i].ack_fpb = dectnr_l2_ctx.last_frame_ack_fpb;
+		dectnr_l2_ctx.rx_frames[i].ack_seb = dectnr_l2_ctx.last_frame_ack_seb;
+		dectnr_l2_ctx.last_frame_ack_fpb = false;
+		dectnr_l2_ctx.last_frame_ack_seb = false;
+
+		k_fifo_put(&dectnr_l2_ctx.rx_fifo, &dectnr_l2_ctx.rx_frames[i]);
+
+		return;
+	}
+	LOG_ERR("Not enough rx frames allocated for 15.4 driver!");
+}
+
+/* Physical Data Channel CRC error notification. */
+static void pdc_crc_err(
+	const uint64_t *time, const struct nrf_modem_dect_phy_rx_pdc_crc_failure *crc_failure)
+{
+	LOG_DBG("pdc_crc_err cb time %"PRIu64"", *time);
+	ot_rx_result = OT_ERROR_FCS;
+	set_pending_event(PENDING_EVENT_RX_FAILED);
+}
+
+/* RSSI measurement result notification. */
+static void rssi(const uint64_t *time, const struct nrf_modem_dect_phy_rssi_meas *status)
+{
+	LOG_DBG("rssi cb time %"PRIu64" carrier %d", *time, status->carrier);
+}
+
+/* Callback after link configuration operation. */
+static void link_config(const uint64_t *time, enum nrf_modem_dect_phy_err err)
+{
+	LOG_DBG("link_config cb time %"PRIu64" status %d", *time, err);
+}
+
+/* Callback after time query operation. */
+static void time_get(const uint64_t *time, enum nrf_modem_dect_phy_err err)
+{
+	LOG_DBG("time_get cb time %"PRIu64" status %d", *time, err);
+}
+
+/* Callback after capability get operation. */
+static void capability_get(const uint64_t *time, enum nrf_modem_dect_phy_err err,
+		    const struct nrf_modem_dect_phy_capability *capability)
+{
+	LOG_DBG("capability_get cb time %"PRIu64" status %d", *time, err);
+}
+
+/* Dect PHY callbacks. */
+static struct nrf_modem_dect_phy_callbacks dect_phy_callbacks = {
+	.init = init,
+	.deinit = deinit,
+	.op_complete = op_complete,
+	.rx_stop = rx_stop,
+	.pcc = pcc,
+	.pcc_crc_err = pcc_crc_err,
+	.pdc = pdc,
+	.pdc_crc_err = pdc_crc_err,
+	.rssi = rssi,
+	.link_config = link_config,
+	.time_get = time_get,
+	.capability_get = capability_get,
+};
+
+/* Dect PHY init parameters. */
+static struct nrf_modem_dect_phy_init_params dect_phy_init_params = {
+	.harq_rx_expiry_time_us = 5000000,
+	.harq_rx_process_count = 4,
+};
+
+static void dataInit(void)
+{
+	net_tx_pkt = net_pkt_alloc(K_NO_WAIT);
+	__ASSERT_NO_MSG(net_tx_pkt != NULL);
+
+	net_tx_buf = net_pkt_get_reserve_tx_data(OT_RADIO_FRAME_MAX_SIZE,
+						 K_NO_WAIT);
+	__ASSERT_NO_MSG(net_tx_buf != NULL);
+
+	net_pkt_append_buffer(net_tx_pkt, net_tx_buf);
+
+	ot_transmit_frame.mPsdu = net_tx_buf->data;
+}
+
+/* Receive operation. */
+int dect_receive(void)
+{
+	int err;
+
+	struct nrf_modem_dect_phy_rx_params rx_op_params = {
+		.start_time = 0,
+		.handle = DECT_RX_HANDLE,
+		.network_id = ot_pan_id,
+		.mode = NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS,
+		.rssi_interval = NRF_MODEM_DECT_PHY_RSSI_INTERVAL_OFF,
+		.link_id = NRF_MODEM_DECT_PHY_LINK_UNSPECIFIED,
+		.rssi_level = DEFAULT_SENSITIVITY,
+		.carrier = DECT_CARRIER,
+		.duration = 1 * 30000 *
+			    NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ,
+		.filter.short_network_id = ot_pan_id & 0xff,
+		.filter.is_short_network_id_used = 1,
+		/* listen for everything (broadcast mode used) */
+		.filter.receiver_identity = 0,
+	};
+	k_sem_take(&radio_sem, K_FOREVER);
+	err = nrf_modem_dect_phy_rx(&rx_op_params);
+	if (err != 0) {
+		return err;
+	}
+
+	return 0;
 }
 
 void platformRadioInit(void)
 {
-	struct ieee802154_config cfg;
-
 	dataInit();
-
-	__ASSERT_NO_MSG(device_is_ready(radio_dev));
-
-	radio_api = (struct ieee802154_radio_api *)radio_dev->api;
-	if (!radio_api) {
-		return;
-	}
-
 	k_work_queue_start(&ot_work_q, ot_task_stack,
 			   K_KERNEL_STACK_SIZEOF(ot_task_stack),
 			   OT_WORKER_PRIORITY, NULL);
 	k_thread_name_set(&ot_work_q.thread, "ot_radio_workq");
 
-	if ((radio_api->get_capabilities(radio_dev) &
-	     IEEE802154_HW_TX_RX_ACK) != IEEE802154_HW_TX_RX_ACK) {
-		LOG_ERR("Only radios with automatic ack handling "
-			"are currently supported");
-		k_panic();
-	}
+	k_fifo_init(&dectnr_l2_ctx.rx_fifo);
 
-	cfg.event_handler = handle_radio_event;
-	radio_api->configure(radio_dev, IEEE802154_CONFIG_EVENT_HANDLER, &cfg);
+	k_thread_create(&dectnr_l2_ctx.rx_thread, dectnr_l2_ctx.rx_stack,
+			DECT_RX_STACK_SIZE,
+			dect_rx_thread, NULL, NULL, NULL,
+			K_PRIO_COOP(2), 0, K_NO_WAIT);
 }
 
-void transmit_message(struct k_work *tx_job)
+static const int16_t byte_per_mcs_and_length[5][16] = {
+    { 0,  17,  33,  50,  67,  83,  99, 115, 133, 149, 165, 181, 197, 213, 233, 249},
+    { 4,  37,  69, 103, 137, 169, 201, 233, 263, 295, 327, 359, 391, 423, 463, 495},
+    { 7,  57, 107, 157, 205, 253, 295, 343, 399, 447, 495, 540, 596, 644, 692,  -1},
+    {11,  77, 141, 209, 271, 335, 399, 463, 532, 596, 660,  -1,  -1,  -1,  -1,  -1},
+    {18, 117, 217, 311, 407, 503, 604, 700,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1}};
+
+void dect_mac_utils_get_packet_length(size_t *data_size, uint32_t *mcs, uint32_t *packet_length_type, uint32_t *packet_length)
 {
-	int tx_err;
+
+    *packet_length_type = 0;
+
+    for (*packet_length = 0; *packet_length < 16; (*packet_length)++)
+    {
+		if (byte_per_mcs_and_length[*mcs][*packet_length] == -1) {
+			packet_length--;
+			break;
+		}
+        if (byte_per_mcs_and_length[*mcs][*packet_length] >= (int16_t)*data_size)
+        {
+            break;
+        }
+    }
+}
+
+/* Send operation. */
+int dect_transmit(bool rx_on_when_idle, void *data, size_t data_size, uint64_t start_time)
+{
+	int err;
+	uint32_t df_mcs = 4;
+	uint32_t packet_length_type = 0;
+	uint32_t packet_length = 0;
+
+	struct phy_ctrl_field_common header = {
+		.header_format = 0x0,
+		.packet_length_type = 0x0,
+		.short_network_id = (ot_pan_id & 0xff),
+		.transmitter_id_hi = (dect_device_id >> 8),
+		.transmitter_id_lo = (dect_device_id & 0xff),
+		.transmit_power = tx_power,
+		.reserved = 0,
+	};
+
+	struct nrf_modem_dect_phy_tx_params tx_op_params = {
+		.start_time = start_time,
+		.handle = DECT_TX_HANDLE,
+		.network_id = ot_pan_id,
+		.phy_type = 0,
+		.lbt_rssi_threshold_max = CONFIG_RSSI_TARGET,
+		.carrier = DECT_CARRIER,
+		.lbt_period = NRF_MODEM_DECT_LBT_PERIOD_MIN,
+		//.lbt_period = 0,
+		.phy_header = (union nrf_modem_dect_phy_hdr *)&header,
+		.data = data,
+		.data_size = data_size,
+	};
+
+	struct nrf_modem_dect_phy_rx_params rx_op_params = {
+		.start_time = 0,
+		.handle = DECT_RX_HANDLE,
+		.network_id = ot_pan_id,
+		.mode = NRF_MODEM_DECT_PHY_RX_MODE_CONTINUOUS,
+		.rssi_interval = NRF_MODEM_DECT_PHY_RSSI_INTERVAL_OFF,
+		.link_id = NRF_MODEM_DECT_PHY_LINK_UNSPECIFIED,
+		.rssi_level = DEFAULT_SENSITIVITY,
+		.carrier = DECT_CARRIER,
+		.duration = 1 * 10000 *
+			    NRF_MODEM_DECT_MODEM_TIME_TICK_RATE_KHZ,
+		.filter.short_network_id = ot_pan_id & 0xff,
+		.filter.is_short_network_id_used = 1,
+		/* listen for everything (broadcast mode used) */
+		.filter.receiver_identity = 0,
+	};
+
+	dect_mac_utils_get_packet_length(&data_size, &df_mcs, &packet_length_type, &packet_length);
+
+	header.packet_length_type = packet_length_type;
+	header.packet_length = packet_length;
+	header.df_mcs = df_mcs;
+	LOG_DBG("df_mcs:%u packet_length:%u", df_mcs, packet_length);
+
+	/* Wait for radio operation to complete. */
+	err = nrf_modem_dect_phy_rx_stop(DECT_RX_HANDLE);
+	if (err != 0) {
+		LOG_ERR("fail to stop dect phy rx: %d", err);
+		return err;
+	}
+	k_sem_take(&radio_sem, K_FOREVER);
+	LOG_HEXDUMP_DBG(data, data_size, "tx frame:");
+
+    struct nrf_modem_dect_phy_tx_rx_params tx_rx_params = {
+        .tx = tx_op_params,
+        .rx = rx_op_params,
+    };
+
+    /* start the transmission */
+    err = nrf_modem_dect_phy_tx_rx(&tx_rx_params);
+    if (err)
+    {
+        LOG_ERR("nrf_modem_dect_phy_tx_rx() returned %d", err);
+		return err;
+    }
+	k_sem_take(&radio_sem, K_FOREVER);
+	if (dect_op_result != NRF_MODEM_DECT_PHY_SUCCESS) {
+		err = -dect_op_result;
+	} else {
+		err = 0;
+	}
+	/* TODO: handle ACK and HARQ */
+
+		return err;
+	}
+
+static void transmit_message(struct k_work *tx_job)
+{
+	int err;
 
 	ARG_UNUSED(tx_job);
 
-	/*
-	 * The payload is already in tx_payload->data,
-	 * but we need to set the length field
-	 * according to sTransmitFrame.length.
-	 * We subtract the FCS size as radio driver
-	 * adds CRC and increases frame length on its own.
-	 */
-	tx_payload->len = sTransmitFrame.mLength - FCS_SIZE;
+	__ASSERT_NO_MSG(ot_transmit_frame.mLength <= OT_RADIO_FRAME_MAX_SIZE);
+	net_tx_buf->len = ot_transmit_frame.mLength;
+	ot_channel = ot_transmit_frame.mChannel;
 
-	channel = sTransmitFrame.mChannel;
+	net_pkt_set_ieee802154_frame_secured(net_tx_pkt,
+					     ot_transmit_frame.mInfo.mTxInfo.mIsSecurityProcessed);
+	net_pkt_set_ieee802154_mac_hdr_rdy(net_tx_pkt, ot_transmit_frame.mInfo.mTxInfo.mIsHeaderUpdated);
 
-	radio_api->set_channel(radio_dev, channel);
-	radio_api->set_txpower(radio_dev, get_transmit_power_for_channel(channel));
-
-#if defined(CONFIG_OPENTHREAD_TIME_SYNC)
-	if (sTransmitFrame.mInfo.mTxInfo.mIeInfo->mTimeIeOffset != 0) {
-		uint8_t *time_ie =
-			sTransmitFrame.mPsdu + sTransmitFrame.mInfo.mTxInfo.mIeInfo->mTimeIeOffset;
-		uint64_t offset_plat_time =
-			otPlatTimeGet() + sTransmitFrame.mInfo.mTxInfo.mIeInfo->mNetworkTimeOffset;
-
-		*(time_ie++) = sTransmitFrame.mInfo.mTxInfo.mIeInfo->mTimeSyncSeq;
-		sys_put_le64(offset_plat_time, time_ie);
-	}
-#endif
-
-	net_pkt_set_ieee802154_frame_secured(tx_pkt,
-					     sTransmitFrame.mInfo.mTxInfo.mIsSecurityProcessed);
-	net_pkt_set_ieee802154_mac_hdr_rdy(tx_pkt, sTransmitFrame.mInfo.mTxInfo.mIsHeaderUpdated);
-
-	if ((radio_api->get_capabilities(radio_dev) & IEEE802154_HW_TXTIME) &&
-	    (sTransmitFrame.mInfo.mTxInfo.mTxDelay != 0)) {
-#if defined(CONFIG_NET_PKT_TXTIME)
-		uint32_t tx_at = sTransmitFrame.mInfo.mTxInfo.mTxDelayBaseTime +
-				 sTransmitFrame.mInfo.mTxInfo.mTxDelay;
-		net_pkt_set_timestamp_ns(tx_pkt, convert_32bit_us_wrapped_to_64bit_ns(tx_at));
-#endif
-		tx_err =
-			radio_api->tx(radio_dev, IEEE802154_TX_MODE_TXTIME_CCA, tx_pkt, tx_payload);
-	} else if (sTransmitFrame.mInfo.mTxInfo.mCsmaCaEnabled) {
-		if (radio_api->get_capabilities(radio_dev) & IEEE802154_HW_CSMA) {
-			tx_err = radio_api->tx(radio_dev, IEEE802154_TX_MODE_CSMA_CA, tx_pkt,
-					       tx_payload);
-		} else {
-			tx_err = radio_api->cca(radio_dev);
-			if (tx_err == 0) {
-				tx_err = radio_api->tx(radio_dev, IEEE802154_TX_MODE_DIRECT, tx_pkt,
-						       tx_payload);
-			}
-		}
+	/* Set PSDU length field and data field */
+	if (OT_PHR_LENGTH == 1) {
+		*(uint8_t *)dect_tx_psdu = (uint8_t)net_tx_buf->len;
+	} else if (OT_PHR_LENGTH == 2) {
+		*(uint16_t *)dect_tx_psdu = net_tx_buf->len;
 	} else {
-		tx_err = radio_api->tx(radio_dev, IEEE802154_TX_MODE_DIRECT, tx_pkt, tx_payload);
+		__ASSERT_NO_MSG(0);
+	}
+	memcpy(dect_tx_psdu + OT_PHR_LENGTH, net_tx_buf->data, net_tx_buf->len);
+
+	if ((ot_radio_caps & OT_RADIO_CAPS_TRANSMIT_TIMING) &&
+	    (ot_transmit_frame.mInfo.mTxInfo.mTxDelay != 0)) {
+		/* Transmit packet in the future, perform CCA before transmission. */
+#if defined(CONFIG_NET_PKT_TXTIME)
+		uint32_t tx_at = ot_transmit_frame.mInfo.mTxInfo.mTxDelayBaseTime +
+				 ot_transmit_frame.mInfo.mTxInfo.mTxDelay;
+		net_pkt_set_timestamp_ns(net_tx_pkt, convert_32bit_us_wrapped_to_64bit_ns(tx_at));
+#endif
+		err = dect_transmit(1, dect_tx_psdu, net_tx_buf->len + OT_PHR_LENGTH, 0);
+	} else if (ot_transmit_frame.mInfo.mTxInfo.mCsmaCaEnabled) {
+		/* Perform full CSMA/CA procedure before packet transmission */
+		err = dect_transmit(1, dect_tx_psdu, net_tx_buf->len + OT_PHR_LENGTH, 0);
+		} else {
+		/* Transmit packet immediately, no CCA */
+		err = dect_transmit(1, dect_tx_psdu, net_tx_buf->len + OT_PHR_LENGTH, 0);
 	}
 
 	/*
@@ -441,22 +723,11 @@ void transmit_message(struct k_work *tx_job)
 	 * - OT_ERROR_ABORT
 	 * Any other error passed to `otPlatRadioTxDone` will result in assertion.
 	 */
-	switch (tx_err) {
-	case 0:
-		tx_result = OT_ERROR_NONE;
-		break;
-	case -ENOMSG:
-		tx_result = OT_ERROR_NO_ACK;
-		break;
-	case -EBUSY:
-		tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
-		break;
-	case -EIO:
-		tx_result = OT_ERROR_ABORT;
-		break;
-	default:
-		tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
-		break;
+	LOG_ERR("dect_transmit, err %d", err);
+	if (err == 0) {
+		ot_tx_result = OT_ERROR_NONE;
+	} else {
+		ot_tx_result = OT_ERROR_CHANNEL_ACCESS_FAILURE;
 	}
 
 	set_pending_event(PENDING_EVENT_TX_DONE);
@@ -464,16 +735,16 @@ void transmit_message(struct k_work *tx_job)
 
 static inline void handle_tx_done(otInstance *aInstance)
 {
-	sTransmitFrame.mInfo.mTxInfo.mIsSecurityProcessed =
-		net_pkt_ieee802154_frame_secured(tx_pkt);
-	sTransmitFrame.mInfo.mTxInfo.mIsHeaderUpdated = net_pkt_ieee802154_mac_hdr_rdy(tx_pkt);
+	ot_transmit_frame.mInfo.mTxInfo.mIsSecurityProcessed =
+		net_pkt_ieee802154_frame_secured(net_tx_pkt);
+	ot_transmit_frame.mInfo.mTxInfo.mIsHeaderUpdated = net_pkt_ieee802154_mac_hdr_rdy(net_tx_pkt);
 
 	if (IS_ENABLED(CONFIG_OPENTHREAD_DIAG) && otPlatDiagModeGet()) {
-		otPlatDiagRadioTransmitDone(aInstance, &sTransmitFrame, tx_result);
+		otPlatDiagRadioTransmitDone(aInstance, &ot_transmit_frame, ot_tx_result);
 	} else {
-		otPlatRadioTxDone(aInstance, &sTransmitFrame, ack_frame.mLength ? &ack_frame : NULL,
-				  tx_result);
-		ack_frame.mLength = 0;
+		otPlatRadioTxDone(aInstance, &ot_transmit_frame, ot_ack_frame.mLength ? &ot_ack_frame : NULL,
+				  ot_tx_result);
+		ot_ack_frame.mLength = 0;
 	}
 }
 
@@ -486,7 +757,7 @@ static void openthread_handle_received_frame(otInstance *instance,
 	recv_frame.mPsdu = net_buf_frag_last(pkt->buffer)->data;
 	/* Length inc. CRC. */
 	recv_frame.mLength = net_buf_frags_len(pkt->buffer);
-	recv_frame.mChannel = platformRadioChannelGet(instance);
+	recv_frame.mChannel = ot_channel;
 	recv_frame.mInfo.mRxInfo.mLqi = net_pkt_ieee802154_lqi(pkt);
 	recv_frame.mInfo.mRxInfo.mRssi = net_pkt_ieee802154_rssi_dbm(pkt);
 	recv_frame.mInfo.mRxInfo.mAckedWithFramePending = net_pkt_ieee802154_ack_fpb(pkt);
@@ -543,6 +814,7 @@ exit:
 
 int notify_new_rx_frame(struct net_pkt *pkt)
 {
+	LOG_DBG("notify_new_rx_frame");
 	k_fifo_put(&rx_pkt_fifo, pkt);
 	set_pending_event(PENDING_EVENT_FRAME_RECEIVED);
 
@@ -551,26 +823,11 @@ int notify_new_rx_frame(struct net_pkt *pkt)
 
 int notify_new_tx_frame(struct net_pkt *pkt)
 {
+	LOG_DBG("notify_new_tx_frame");
 	k_fifo_put(&tx_pkt_fifo, pkt);
 	set_pending_event(PENDING_EVENT_FRAME_TO_SEND);
 
 	return 0;
-}
-
-static int run_tx_task(otInstance *aInstance)
-{
-	static K_WORK_DEFINE(tx_job, transmit_message);
-
-	ARG_UNUSED(aInstance);
-
-	if (!k_work_is_pending(&tx_job)) {
-		sState = OT_RADIO_STATE_TRANSMIT;
-
-		k_work_submit_to_queue(&ot_work_q, &tx_job);
-		return 0;
-	} else {
-		return -EBUSY;
-	}
 }
 
 void platformRadioProcess(otInstance *aInstance)
@@ -589,7 +846,6 @@ void platformRadioProcess(otInstance *aInstance)
 			}
 		}
 	}
-
 	if (is_pending_event_set(PENDING_EVENT_FRAME_RECEIVED)) {
 		struct net_pkt *rx_pkt;
 
@@ -602,23 +858,22 @@ void platformRadioProcess(otInstance *aInstance)
 	if (is_pending_event_set(PENDING_EVENT_RX_FAILED)) {
 		reset_pending_event(PENDING_EVENT_RX_FAILED);
 		if (IS_ENABLED(CONFIG_OPENTHREAD_DIAG) && otPlatDiagModeGet()) {
-			otPlatDiagRadioReceiveDone(aInstance, NULL, rx_result);
+			otPlatDiagRadioReceiveDone(aInstance, NULL, ot_rx_result);
 		} else {
-			otPlatRadioReceiveDone(aInstance, NULL, rx_result);
+			otPlatRadioReceiveDone(aInstance, NULL, ot_rx_result);
 		}
 	}
 
 	if (is_pending_event_set(PENDING_EVENT_TX_STARTED)) {
 		reset_pending_event(PENDING_EVENT_TX_STARTED);
-		otPlatRadioTxStarted(aInstance, &sTransmitFrame);
+		otPlatRadioTxStarted(aInstance, &ot_transmit_frame);
 	}
 
 	if (is_pending_event_set(PENDING_EVENT_TX_DONE)) {
 		reset_pending_event(PENDING_EVENT_TX_DONE);
-
-		if (sState == OT_RADIO_STATE_TRANSMIT ||
-		    radio_api->get_capabilities(radio_dev) & IEEE802154_HW_SLEEP_TO_TX) {
-			sState = OT_RADIO_STATE_RECEIVE;
+		if (ot_state == OT_RADIO_STATE_TRANSMIT ||
+		    ot_radio_caps & OT_RADIO_CAPS_SLEEP_TO_TX) {
+			ot_state = OT_RADIO_STATE_RECEIVE;
 			handle_tx_done(aInstance);
 		}
 	}
@@ -629,25 +884,8 @@ void platformRadioProcess(otInstance *aInstance)
 	}
 
 	/* handle events that can't run during transmission */
-	if (sState != OT_RADIO_STATE_TRANSMIT) {
-		if (is_pending_event_set(PENDING_EVENT_DETECT_ENERGY)) {
-			radio_api->set_channel(radio_dev,
-					       energy_detection_channel);
-
-			if (!radio_api->ed_scan(radio_dev,
-						energy_detection_time,
-						energy_detected)) {
-				reset_pending_event(
-					PENDING_EVENT_DETECT_ENERGY);
-			} else {
-				event_pending = true;
-			}
-		}
-
-		if (is_pending_event_set(PENDING_EVENT_DETECT_ENERGY_DONE)) {
-			otPlatRadioEnergyScanDone(aInstance, (int8_t) energy_detected_value);
-			reset_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
-		}
+	if (ot_state != OT_RADIO_STATE_TRANSMIT) {
+		/* TODO: Handle energy detection result */
 	}
 
 	if (event_pending) {
@@ -659,45 +897,54 @@ uint16_t platformRadioChannelGet(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
 
-	return channel;
+	return ot_channel;
 }
 
-void otPlatRadioSetPanId(otInstance *aInstance, uint16_t aPanId)
+void otPlatRadioSetPanId(otInstance *aInstance, otPanId aPanId)
 {
 	ARG_UNUSED(aInstance);
 
-	radio_api->filter(radio_dev, true, IEEE802154_FILTER_TYPE_PAN_ID,
-			  (struct ieee802154_filter *) &aPanId);
+	LOG_INF("otPlatRadioSetPanId: %x", aPanId);
+    ot_pan_id = aPanId;
+}
+
+static void ReverseExtAddress(otExtAddress *aReversed, const otExtAddress *aOrigin)
+{
+    for (size_t i = 0; i < sizeof(*aReversed); i++)
+    {
+        aReversed->m8[i] = aOrigin->m8[sizeof(*aOrigin) - 1 - i];
+		printk("%x ", aReversed->m8[i]);
+    }
+	printk("\n");
 }
 
 void otPlatRadioSetExtendedAddress(otInstance *aInstance,
 				   const otExtAddress *aExtAddress)
 {
 	ARG_UNUSED(aInstance);
+	LOG_DBG("otPlatRadioSetExtendedAddress");
 
-	radio_api->filter(radio_dev, true, IEEE802154_FILTER_TYPE_IEEE_ADDR,
-			  (struct ieee802154_filter *) &aExtAddress);
+    ReverseExtAddress(&ot_ext_addr, aExtAddress);
 }
 
 void otPlatRadioSetShortAddress(otInstance *aInstance, uint16_t aShortAddress)
 {
 	ARG_UNUSED(aInstance);
-
-	radio_api->filter(radio_dev, true, IEEE802154_FILTER_TYPE_SHORT_ADDR,
-			  (struct ieee802154_filter *) &aShortAddress);
+	LOG_DBG("otPlatRadioSetShortAddress: %x", aShortAddress);
+	ot_short_addr = aShortAddress;
 }
 
 bool otPlatRadioIsEnabled(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
 
-	return (sState != OT_RADIO_STATE_DISABLED) ? true : false;
+	return (ot_state != OT_RADIO_STATE_DISABLED) ? true : false;
 }
 
 otError otPlatRadioEnable(otInstance *aInstance)
 {
 	if (!otPlatRadioIsEnabled(aInstance)) {
-		sState = OT_RADIO_STATE_SLEEP;
+		ot_state = OT_RADIO_STATE_SLEEP;
 	}
 
 	return OT_ERROR_NONE;
@@ -706,7 +953,7 @@ otError otPlatRadioEnable(otInstance *aInstance)
 otError otPlatRadioDisable(otInstance *aInstance)
 {
 	if (otPlatRadioIsEnabled(aInstance)) {
-		sState = OT_RADIO_STATE_DISABLED;
+		ot_state = OT_RADIO_STATE_DISABLED;
 	}
 
 	return OT_ERROR_NONE;
@@ -718,12 +965,12 @@ otError otPlatRadioSleep(otInstance *aInstance)
 
 	otError error = OT_ERROR_INVALID_STATE;
 
-	if (sState == OT_RADIO_STATE_SLEEP ||
-	    sState == OT_RADIO_STATE_RECEIVE ||
-	    sState == OT_RADIO_STATE_TRANSMIT) {
+	if (ot_state == OT_RADIO_STATE_SLEEP ||
+	    ot_state == OT_RADIO_STATE_RECEIVE ||
+	    ot_state == OT_RADIO_STATE_TRANSMIT) {
 		error = OT_ERROR_NONE;
-		radio_api->stop(radio_dev);
-		sState = OT_RADIO_STATE_SLEEP;
+		/* Put the radio to sleep mode. Currently sleep mode of DECT NR+ radio is not supported */
+		ot_state = OT_RADIO_STATE_SLEEP;
 	}
 
 	return error;
@@ -733,65 +980,33 @@ otError otPlatRadioReceive(otInstance *aInstance, uint8_t aChannel)
 {
 	ARG_UNUSED(aInstance);
 
-	channel = aChannel;
+	LOG_ERR("otPlatRadioReceive");
+	ot_channel = aChannel;
 
-	radio_api->set_channel(radio_dev, aChannel);
-	radio_api->set_txpower(radio_dev, get_transmit_power_for_channel(channel));
-	radio_api->start(radio_dev);
-	sState = OT_RADIO_STATE_RECEIVE;
+	if (ot_state != OT_RADIO_STATE_RECEIVE) {
+		int err;
+
+		err = dect_receive();
+		if (err) {
+			LOG_ERR("Reception failed, err %d", err);
+			return OT_ERROR_FAILED;
+		}
+	}
+	ot_state = OT_RADIO_STATE_RECEIVE;
 
 	return OT_ERROR_NONE;
 }
-
-#if defined(CONFIG_OPENTHREAD_CSL_RECEIVER)
-otError otPlatRadioReceiveAt(otInstance *aInstance, uint8_t aChannel,
-			     uint32_t aStart, uint32_t aDuration)
-{
-	int result;
-
-	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.rx_slot.channel = aChannel,
-		.rx_slot.start = convert_32bit_us_wrapped_to_64bit_ns(aStart),
-		.rx_slot.duration = (net_time_t)aDuration * NSEC_PER_USEC,
-	};
-
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_RX_SLOT,
-				      &config);
-
-	return result ? OT_ERROR_FAILED : OT_ERROR_NONE;
-}
-#endif
 
 otError platformRadioTransmitCarrier(otInstance *aInstance, bool aEnable)
 {
-	if (radio_api->continuous_carrier == NULL) {
-		return OT_ERROR_NOT_IMPLEMENTED;
-	}
-
-	if ((aEnable) && (sState == OT_RADIO_STATE_RECEIVE)) {
-		radio_api->set_txpower(radio_dev, get_transmit_power_for_channel(channel));
-
-		if (radio_api->continuous_carrier(radio_dev) != 0) {
-			return OT_ERROR_FAILED;
-		}
-
-		sState = OT_RADIO_STATE_TRANSMIT;
-	} else if ((!aEnable) && (sState == OT_RADIO_STATE_TRANSMIT)) {
-		return otPlatRadioReceive(aInstance, channel);
-	} else {
-		return OT_ERROR_INVALID_STATE;
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otRadioState otPlatRadioGetState(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
 
-	return sState;
+	return ot_state;
 }
 
 otError otPlatRadioTransmit(otInstance *aInstance, otRadioFrame *aPacket)
@@ -801,15 +1016,19 @@ otError otPlatRadioTransmit(otInstance *aInstance, otRadioFrame *aPacket)
 	ARG_UNUSED(aInstance);
 	ARG_UNUSED(aPacket);
 
-	__ASSERT_NO_MSG(aPacket == &sTransmitFrame);
+	__ASSERT_NO_MSG(aPacket == &ot_transmit_frame);
 
-	enum ieee802154_hw_caps radio_caps;
+	if ((ot_state == OT_RADIO_STATE_RECEIVE) || (ot_radio_caps & OT_RADIO_CAPS_SLEEP_TO_TX)) {
+		static K_WORK_DEFINE(tx_job, transmit_message);
 
-	radio_caps = radio_api->get_capabilities(radio_dev);
+		ARG_UNUSED(aInstance);
 
-	if ((sState == OT_RADIO_STATE_RECEIVE) || (radio_caps & IEEE802154_HW_SLEEP_TO_TX)) {
-		if (run_tx_task(aInstance) == 0) {
+		if (!k_work_is_pending(&tx_job)) {
+			ot_state = OT_RADIO_STATE_TRANSMIT;
+			k_work_submit_to_queue(&ot_work_q, &tx_job);
 			error = OT_ERROR_NONE;
+		} else {
+			error = -EBUSY;
 		}
 	}
 
@@ -820,308 +1039,108 @@ otRadioFrame *otPlatRadioGetTransmitBuffer(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
 
-	return &sTransmitFrame;
-}
-
-static void get_rssi_energy_detected(const struct device *dev, int16_t max_ed)
-{
-	ARG_UNUSED(dev);
-	energy_detected_value = max_ed;
-	k_sem_give(&radio_sem);
+	return &ot_transmit_frame;
 }
 
 int8_t otPlatRadioGetRssi(otInstance *aInstance)
 {
-	int8_t ret_rssi = INT8_MAX;
-	int error = 0;
-	const uint16_t detection_time = 1;
-	enum ieee802154_hw_caps radio_caps;
-	ARG_UNUSED(aInstance);
+	LOG_INF("otPlatRadioGetRssi: %d", last_rssi);
 
-	radio_caps = radio_api->get_capabilities(radio_dev);
-
-	if (!(radio_caps & IEEE802154_HW_ENERGY_SCAN)) {
-		/*
-		 * TODO: No API in Zephyr to get the RSSI
-		 * when IEEE802154_HW_ENERGY_SCAN is not available
-		 */
-		ret_rssi = 0;
-	} else {
-		/*
-		 * Blocking implementation of get RSSI
-		 * using no-blocking ed_scan
-		 */
-		error = radio_api->ed_scan(radio_dev, detection_time,
-					   get_rssi_energy_detected);
-
-		if (error == 0) {
-			k_sem_take(&radio_sem, K_FOREVER);
-
-			ret_rssi = (int8_t)energy_detected_value;
-		}
-	}
-
-	return ret_rssi;
+	return last_rssi;
 }
 
 otRadioCaps otPlatRadioGetCaps(otInstance *aInstance)
 {
-	otRadioCaps caps = OT_RADIO_CAPS_NONE;
-
-	enum ieee802154_hw_caps radio_caps;
 	ARG_UNUSED(aInstance);
-	__ASSERT(radio_api,
-	    "platformRadioInit needs to be called prior to otPlatRadioGetCaps");
 
-	radio_caps = radio_api->get_capabilities(radio_dev);
+	LOG_INF("otPlatRadioGetCaps: %x", ot_radio_caps);
 
-	if (radio_caps & IEEE802154_HW_ENERGY_SCAN) {
-		caps |= OT_RADIO_CAPS_ENERGY_SCAN;
-	}
-
-	if (radio_caps & IEEE802154_HW_CSMA) {
-		caps |= OT_RADIO_CAPS_CSMA_BACKOFF;
-	}
-
-	if (radio_caps & IEEE802154_HW_TX_RX_ACK) {
-		caps |= OT_RADIO_CAPS_ACK_TIMEOUT;
-	}
-
-	if (radio_caps & IEEE802154_HW_SLEEP_TO_TX) {
-		caps |= OT_RADIO_CAPS_SLEEP_TO_TX;
-	}
-
-#if !defined(CONFIG_OPENTHREAD_THREAD_VERSION_1_1)
-	if (radio_caps & IEEE802154_HW_TX_SEC) {
-		caps |= OT_RADIO_CAPS_TRANSMIT_SEC;
-	}
-#endif
-
-#if defined(CONFIG_NET_PKT_TXTIME)
-	if (radio_caps & IEEE802154_HW_TXTIME) {
-		caps |= OT_RADIO_CAPS_TRANSMIT_TIMING;
-	}
-#endif
-
-	if (radio_caps & IEEE802154_HW_RXTIME) {
-		caps |= OT_RADIO_CAPS_RECEIVE_TIMING;
-	}
-
-	if (radio_caps & IEEE802154_RX_ON_WHEN_IDLE) {
-		caps |= OT_RADIO_CAPS_RX_ON_WHEN_IDLE;
-	}
-
-	return caps;
+	return ot_radio_caps;
 }
 
 void otPlatRadioSetRxOnWhenIdle(otInstance *aInstance, bool aRxOnWhenIdle)
 {
-	struct ieee802154_config config = {
-		.rx_on_when_idle = aRxOnWhenIdle
-	};
-
 	ARG_UNUSED(aInstance);
 
 	LOG_DBG("RxOnWhenIdle=%d", aRxOnWhenIdle ? 1 : 0);
-
-	radio_api->configure(radio_dev, IEEE802154_CONFIG_RX_ON_WHEN_IDLE, &config);
+	if (aRxOnWhenIdle) {
+		ot_radio_caps |= OT_RADIO_CAPS_RX_ON_WHEN_IDLE;
+	} else {
+		ot_radio_caps &= ~OT_RADIO_CAPS_RX_ON_WHEN_IDLE;
+	}
 }
 
 bool otPlatRadioGetPromiscuous(otInstance *aInstance)
 {
-	ARG_UNUSED(aInstance);
+	LOG_ERR("otPlatRadioSetPromiscuous is not supported");
 
-	LOG_DBG("PromiscuousMode=%d", promiscuous ? 1 : 0);
-
-	return promiscuous;
+	return false;
 }
 
 void otPlatRadioSetPromiscuous(otInstance *aInstance, bool aEnable)
 {
-	struct ieee802154_config config = {
-		.promiscuous = aEnable
-	};
-
-	ARG_UNUSED(aInstance);
-
-	LOG_DBG("PromiscuousMode=%d", aEnable ? 1 : 0);
-
-	promiscuous = aEnable;
-	/* TODO: Should check whether the radio driver actually supports
-	 *       promiscuous mode, see net_if_l2(iface)->get_flags() and
-	 *       ieee802154_radio_get_hw_capabilities(iface).
-	 */
-	radio_api->configure(radio_dev, IEEE802154_CONFIG_PROMISCUOUS, &config);
+	LOG_ERR("otPlatRadioSetPromiscuous is not supported");
 }
 
 otError otPlatRadioEnergyScan(otInstance *aInstance, uint8_t aScanChannel,
 			      uint16_t aScanDuration)
 {
-	energy_detection_time    = aScanDuration;
-	energy_detection_channel = aScanChannel;
+	LOG_ERR("otPlatRadioEnergyScan\n");
 
-	if (radio_api->ed_scan == NULL) {
-		return OT_ERROR_NOT_IMPLEMENTED;
-	}
-
-	reset_pending_event(PENDING_EVENT_DETECT_ENERGY);
-	reset_pending_event(PENDING_EVENT_DETECT_ENERGY_DONE);
-
-	radio_api->set_channel(radio_dev, aScanChannel);
-
-	if (radio_api->ed_scan(radio_dev, energy_detection_time, energy_detected) != 0) {
-		/*
-		 * OpenThread API does not accept failure of this function,
-		 * it can return 'No Error' or 'Not Implemented' error only.
-		 * If ed_scan start failed event is set to schedule the scan at
-		 * later time.
-		 */
-		LOG_ERR("Failed do start energy scan, scheduling for later");
-		set_pending_event(PENDING_EVENT_DETECT_ENERGY);
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioGetCcaEnergyDetectThreshold(otInstance *aInstance,
 					       int8_t *aThreshold)
 {
-	OT_UNUSED_VARIABLE(aInstance);
-	OT_UNUSED_VARIABLE(aThreshold);
-
+	printk("otPlatRadioGetCcaEnergyDetectThreshold\n");
 	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioSetCcaEnergyDetectThreshold(otInstance *aInstance,
 					       int8_t aThreshold)
 {
-	OT_UNUSED_VARIABLE(aInstance);
-	OT_UNUSED_VARIABLE(aThreshold);
-
+	printk("otPlatRadioSetCcaEnergyDetectThreshold\n");
 	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 void otPlatRadioEnableSrcMatch(otInstance *aInstance, bool aEnable)
 {
-	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.auto_ack_fpb.enabled = aEnable,
-		.auto_ack_fpb.mode = IEEE802154_FPB_ADDR_MATCH_THREAD,
-	};
-
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_AUTO_ACK_FPB,
-				   &config);
+	return;
 }
 
 otError otPlatRadioAddSrcMatchShortEntry(otInstance *aInstance,
 					 const uint16_t aShortAddress)
 {
-	ARG_UNUSED(aInstance);
-
-	uint8_t short_address[SHORT_ADDRESS_SIZE];
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = true,
-		.ack_fpb.addr = short_address,
-		.ack_fpb.extended = false
-	};
-
-	sys_put_le16(aShortAddress, short_address);
-
-	if (radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				 &config) != 0) {
-		return OT_ERROR_NO_BUFS;
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioAddSrcMatchExtEntry(otInstance *aInstance,
 				       const otExtAddress *aExtAddress)
 {
-	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = true,
-		.ack_fpb.addr = (uint8_t *)aExtAddress->m8,
-		.ack_fpb.extended = true
-	};
-
-	if (radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				 &config) != 0) {
-		return OT_ERROR_NO_BUFS;
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioClearSrcMatchShortEntry(otInstance *aInstance,
 					   const uint16_t aShortAddress)
 {
-	ARG_UNUSED(aInstance);
-
-	uint8_t short_address[SHORT_ADDRESS_SIZE];
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = false,
-		.ack_fpb.addr = short_address,
-		.ack_fpb.extended = false
-	};
-
-	sys_put_le16(aShortAddress, short_address);
-
-	if (radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				 &config) != 0) {
-		return OT_ERROR_NO_BUFS;
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 otError otPlatRadioClearSrcMatchExtEntry(otInstance *aInstance,
 					 const otExtAddress *aExtAddress)
 {
-	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = false,
-		.ack_fpb.addr = (uint8_t *)aExtAddress->m8,
-		.ack_fpb.extended = true
-	};
-
-	if (radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				 &config) != 0) {
-		return OT_ERROR_NO_BUFS;
-	}
-
-	return OT_ERROR_NONE;
+	return OT_ERROR_NOT_IMPLEMENTED;
 }
 
 void otPlatRadioClearSrcMatchShortEntries(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = false,
-		.ack_fpb.addr = NULL,
-		.ack_fpb.extended = false
-	};
-
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				   &config);
 }
 
 void otPlatRadioClearSrcMatchExtEntries(otInstance *aInstance)
 {
 	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = {
-		.ack_fpb.enabled = false,
-		.ack_fpb.addr = NULL,
-		.ack_fpb.extended = true
-	};
-
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_ACK_FPB,
-				   &config);
 }
 
 int8_t otPlatRadioGetReceiveSensitivity(otInstance *aInstance)
@@ -1155,11 +1174,7 @@ otError otPlatRadioSetTransmitPower(otInstance *aInstance, int8_t aPower)
 
 uint64_t otPlatTimeGet(void)
 {
-	if (radio_api == NULL || radio_api->get_time == NULL) {
 		return k_ticks_to_us_floor64(k_uptime_ticks());
-	} else {
-		return radio_api->get_time(radio_dev) / NSEC_PER_USEC;
-	}
 }
 
 #if defined(CONFIG_NET_PKT_TXTIME)
@@ -1177,310 +1192,79 @@ void otPlatRadioSetMacKey(otInstance *aInstance, uint8_t aKeyIdMode, uint8_t aKe
 			  const otMacKeyMaterial *aNextKey, otRadioKeyType aKeyType)
 {
 	ARG_UNUSED(aInstance);
-	__ASSERT_NO_MSG(aPrevKey != NULL && aCurrKey != NULL && aNextKey != NULL);
-
-#if defined(CONFIG_OPENTHREAD_PLATFORM_KEYS_EXPORTABLE_ENABLE)
-	__ASSERT_NO_MSG(aKeyType == OT_KEY_TYPE_KEY_REF);
-	size_t keyLen;
-	otError error;
-
-	error = otPlatCryptoExportKey(aPrevKey->mKeyMaterial.mKeyRef,
-				      (uint8_t *)aPrevKey->mKeyMaterial.mKey.m8, OT_MAC_KEY_SIZE,
-				      &keyLen);
-	__ASSERT_NO_MSG(error == OT_ERROR_NONE);
-	error = otPlatCryptoExportKey(aCurrKey->mKeyMaterial.mKeyRef,
-				      (uint8_t *)aCurrKey->mKeyMaterial.mKey.m8, OT_MAC_KEY_SIZE,
-				      &keyLen);
-	__ASSERT_NO_MSG(error == OT_ERROR_NONE);
-	error = otPlatCryptoExportKey(aNextKey->mKeyMaterial.mKeyRef,
-				      (uint8_t *)aNextKey->mKeyMaterial.mKey.m8, OT_MAC_KEY_SIZE,
-				      &keyLen);
-	__ASSERT_NO_MSG(error == OT_ERROR_NONE);
-#else
-	__ASSERT_NO_MSG(aKeyType == OT_KEY_TYPE_LITERAL_KEY);
-#endif
-
-	uint8_t key_id_mode = aKeyIdMode >> 3;
-
-	struct ieee802154_key keys[] = {
-		{
-			.key_id_mode = key_id_mode,
-			.frame_counter_per_key = false,
-		},
-		{
-			.key_id_mode = key_id_mode,
-			.frame_counter_per_key = false,
-		},
-		{
-			.key_id_mode = key_id_mode,
-			.frame_counter_per_key = false,
-		},
-		{
-			.key_value = NULL,
-		},
-	};
-
-	struct ieee802154_key clear_keys[] = {
-		{
-			.key_value = NULL,
-		},
-	};
-
-	if (key_id_mode == 1) {
-		/* aKeyId in range: (1, 0x80) means valid keys */
-		uint8_t prev_key_id = aKeyId == 1 ? 0x80 : aKeyId - 1;
-		uint8_t next_key_id = aKeyId == 0x80 ? 1 : aKeyId + 1;
-
-		keys[0].key_id = &prev_key_id;
-		keys[0].key_value = (uint8_t *)aPrevKey->mKeyMaterial.mKey.m8;
-
-		keys[1].key_id = &aKeyId;
-		keys[1].key_value = (uint8_t *)aCurrKey->mKeyMaterial.mKey.m8;
-
-		keys[2].key_id = &next_key_id;
-		keys[2].key_value = (uint8_t *)aNextKey->mKeyMaterial.mKey.m8;
-	} else {
-		/* aKeyId == 0 is used only to clear keys for stack reset in RCP */
-		__ASSERT_NO_MSG((key_id_mode == 0) && (aKeyId == 0));
-	}
-
-	struct ieee802154_config config = {
-		.mac_keys = aKeyId == 0 ? clear_keys : keys,
-	};
-
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_MAC_KEYS,
-				   &config);
+	LOG_INF("otPlatRadioSetMacKey not implemented. Use software TX security instead");
 }
 
 void otPlatRadioSetMacFrameCounter(otInstance *aInstance,
 				   uint32_t aMacFrameCounter)
 {
 	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = { .frame_counter = aMacFrameCounter };
-
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_FRAME_COUNTER,
-				   &config);
+	LOG_INF("otPlatRadioSetMacFrameCounter not implemented. Use software TX security instead");
 }
 
 void otPlatRadioSetMacFrameCounterIfLarger(otInstance *aInstance, uint32_t aMacFrameCounter)
 {
 	ARG_UNUSED(aInstance);
-
-	struct ieee802154_config config = { .frame_counter = aMacFrameCounter };
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_FRAME_COUNTER_IF_LARGER,
-				   &config);
+	LOG_INF("otPlatRadioSetMacFrameCounterIfLarger not implemented. Use software TX security instead");
 }
 #endif
 
-#if defined(CONFIG_OPENTHREAD_CSL_RECEIVER)
-otError otPlatRadioEnableCsl(otInstance *aInstance, uint32_t aCslPeriod, otShortAddress aShortAddr,
-			     const otExtAddress *aExtAddr)
+static void dectnr_ot_l2_init(struct net_if *iface)
 {
-	struct ieee802154_config config;
-	/* CSL phase will be injected on-the-fly by the driver. */
-	struct ieee802154_header_ie header_ie =
-		IEEE802154_DEFINE_HEADER_IE_CSL_REDUCED(/* phase */ 0, aCslPeriod);
-	int result;
+	struct dectnr_ot_l2_ctx *ctx = net_if_get_device(iface)->data;
 
-	ARG_UNUSED(aInstance);
+	ctx->iface = iface;
+	/* Copy 8 bytes device id */
+	hwinfo_get_device_id((void *)ctx->eui64, sizeof(ctx->eui64));
+	/* Company ID f4-ce-36  */
+	ctx->eui64[0] = 0xF4;
+	ctx->eui64[1] = 0xCE;
+	ctx->eui64[2] = 0x36;
+	net_if_set_link_addr(iface, ctx->eui64, sizeof(ctx->eui64), NET_LINK_IEEE802154);
 
-	/* Configure the CSL period first to give drivers a chance to validate
-	 * the IE for consistency if they wish to.
-	 */
-	config.csl_period = aCslPeriod;
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_CSL_PERIOD, &config);
-	if (result) {
-		return OT_ERROR_FAILED;
-	}
-
-	/* Configure the CSL IE. */
-	config.ack_ie.header_ie = aCslPeriod > 0 ? &header_ie : NULL;
-	config.ack_ie.short_addr = aShortAddr;
-	config.ack_ie.ext_addr = aExtAddr != NULL ? aExtAddr->m8 : NULL;
-	config.ack_ie.purge_ie = false;
-
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_ENH_ACK_HEADER_IE, &config);
-
-	return result ? OT_ERROR_FAILED : OT_ERROR_NONE;
+	ieee802154_init(iface);
 }
 
-otError otPlatRadioResetCsl(otInstance *aInstance)
+static int dectnr_dev_init(const struct device *dev)
 {
-	struct ieee802154_config config = { 0 };
-	int result;
+	ARG_UNUSED(dev);
+	int err;
 
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_CSL_PERIOD, &config);
-	if (result) {
-		return OT_ERROR_FAILED;
+	err = nrf_modem_lib_init();
+	if (err) {
+		LOG_ERR("modem init failed, err %d", err);
+		return -ENODEV;
 	}
+	err = nrf_modem_dect_phy_callback_set(&dect_phy_callbacks);
+	if (err) {
+		LOG_ERR("nrf_modem_dect_phy_callback_set failed, err %d", err);
+		k_panic();
+	}
+	err = nrf_modem_dect_phy_init(&dect_phy_init_params);
+	if (err) {
+		LOG_ERR("nrf_modem_dect_phy_init failed, err %d", err);
+		k_panic();
+	}
+	k_sem_take(&operation_sem, K_FOREVER);
+	if (dect_op_result != NRF_MODEM_DECT_PHY_SUCCESS) {
+		return -ENODEV;;
+	}
+	hwinfo_get_device_id((void *)&dect_device_id, sizeof(dect_device_id));
 
-	config.ack_ie.purge_ie = true;
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_ENH_ACK_HEADER_IE, &config);
-
-	return result ? OT_ERROR_FAILED : OT_ERROR_NONE;
+	LOG_INF("Dect NR+ PHY initialized, device ID: %d", dect_device_id);
+	k_sem_give(&operation_sem);
+	return 0;
 }
 
-void otPlatRadioUpdateCslSampleTime(otInstance *aInstance, uint32_t aCslSampleTime)
-{
-	ARG_UNUSED(aInstance);
+static const struct ieee802154_radio_api dectnr_radio_api = {
+	.iface_api.init = dectnr_ot_l2_init,
+};
 
-	/* CSL sample time points to "start of MAC" while the expected RX time
-	 * refers to "end of SFD".
-	 */
-	struct ieee802154_config config = {
-		.expected_rx_time =
-			convert_32bit_us_wrapped_to_64bit_ns(aCslSampleTime - PHR_DURATION_US),
-	};
+/* OPENTHREAD L2 */
+#define L2_LAYER OPENTHREAD_L2
+#define L2_CTX_TYPE NET_L2_GET_CTX_TYPE(OPENTHREAD_L2)
 
-	(void)radio_api->configure(radio_dev, IEEE802154_CONFIG_EXPECTED_RX_TIME, &config);
-}
-#endif /* CONFIG_OPENTHREAD_CSL_RECEIVER */
-
-uint8_t otPlatRadioGetCslAccuracy(otInstance *aInstance)
-{
-	ARG_UNUSED(aInstance);
-
-	return radio_api->get_sch_acc(radio_dev);
-}
-
-#if defined(CONFIG_OPENTHREAD_PLATFORM_CSL_UNCERT)
-uint8_t otPlatRadioGetCslUncertainty(otInstance *aInstance)
-{
-	ARG_UNUSED(aInstance);
-
-	return CONFIG_OPENTHREAD_PLATFORM_CSL_UNCERT;
-}
-#endif
-
-#if defined(CONFIG_OPENTHREAD_LINK_METRICS_SUBJECT)
-/**
- * Header IE format - IEEE Std. 802.15.4-2015, 7.4.2.1 && 7.4.2.2
- *
- * +---------------------------------+----------------------+
- * | Length    | Element ID | Type=0 |      Vendor OUI      |
- * +-----------+------------+--------+----------------------+
- * |           Bytes: 0-1            |          2-4         |
- * +-----------+---------------------+----------------------+
- * | Bits: 0-6 |    7-14    |   15   | IE_VENDOR_THREAD_OUI |
- * +-----------+------------+--------+----------------------|
- *
- * Thread v1.2.1 Spec., 4.11.3.4.4.6
- * +---------------------------------+-------------------+------------------+
- * |                  Vendor Specific Information                           |
- * +---------------------------------+-------------------+------------------+
- * |                5                |         6         |   7 (optional)   |
- * +---------------------------------+-------------------+------------------+
- * | IE_VENDOR_THREAD_ACK_PROBING_ID | LINK_METRIC_TOKEN | LINK_METRIC_TOKEN|
- * |---------------------------------|-------------------|------------------|
- */
-static void set_vendor_ie_header_lm(bool lqi, bool link_margin, bool rssi, uint8_t *ie_header)
-{
-	/* Vendor-specific IE identifier */
-	const uint8_t ie_vendor_id = 0x00;
-	/* Thread Vendor-specific ACK Probing IE subtype ID */
-	const uint8_t ie_vendor_thread_ack_probing_id = 0x00;
-	/* Thread Vendor-specific IE OUI */
-	const uint32_t ie_vendor_thread_oui = 0xeab89b;
-	/* Thread Vendor-specific ACK Probing IE RSSI value placeholder */
-	const uint8_t ie_vendor_thread_rssi_token = 0x01;
-	/* Thread Vendor-specific ACK Probing IE Link margin value placeholder */
-	const uint8_t ie_vendor_thread_margin_token = 0x02;
-	/* Thread Vendor-specific ACK Probing IE LQI value placeholder */
-	const uint8_t ie_vendor_thread_lqi_token = 0x03;
-	const uint8_t oui_size = 3;
-	const uint8_t sub_type = 1;
-	const uint8_t id_offset = 7;
-	const uint16_t id_mask = 0x00ff << id_offset;
-	const uint8_t type = 0x00;
-	const uint8_t type_offset = 7;
-	const uint8_t type_mask = 0x01 << type_offset;
-	const uint8_t length_mask = 0x7f;
-	uint8_t content_len;
-	uint16_t element_id = 0x0000;
-	uint8_t link_metrics_idx = 6;
-	uint8_t link_metrics_data_len = (uint8_t)lqi + (uint8_t)link_margin + (uint8_t)rssi;
-
-	__ASSERT(link_metrics_data_len <= 2, "Thread limits to 2 metrics at most");
-	__ASSERT(ie_header, "Invalid argument");
-
-	if (link_metrics_data_len == 0) {
-		ie_header[0] = 0;
-		return;
-	}
-
-	/* Set Element ID */
-	element_id = (((uint16_t)ie_vendor_id) << id_offset) & id_mask;
-	sys_put_le16(element_id, &ie_header[0]);
-
-	/* Set Length - number of octets in content field. */
-	content_len = oui_size + sub_type + link_metrics_data_len;
-	ie_header[0] = (ie_header[0] & ~length_mask) | (content_len & length_mask);
-
-	/* Set Type */
-	ie_header[1] = (ie_header[1] & ~type_mask) | (type & type_mask);
-
-	/* Set Vendor Oui */
-	sys_put_le24(ie_vendor_thread_oui, &ie_header[2]);
-
-	/* Set SubType */
-	ie_header[5] = ie_vendor_thread_ack_probing_id;
-
-	/* Set Link Metrics Tokens
-	 * TODO: Thread requires the order of requested metrics by the Link Metrics Initiator
-	 *       to be kept by the Link Metrics Subject in the ACKs.
-	 */
-	if (lqi) {
-		ie_header[link_metrics_idx++] = ie_vendor_thread_lqi_token;
-	}
-
-	if (link_margin) {
-		ie_header[link_metrics_idx++] = ie_vendor_thread_margin_token;
-	}
-
-	if (rssi) {
-		ie_header[link_metrics_idx++] = ie_vendor_thread_rssi_token;
-	}
-}
-
-otError otPlatRadioConfigureEnhAckProbing(otInstance *aInstance, otLinkMetrics aLinkMetrics,
-					  const otShortAddress aShortAddress,
-					  const otExtAddress *aExtAddress)
-{
-	struct ieee802154_config config = {
-		.ack_ie.short_addr = aShortAddress,
-		.ack_ie.ext_addr = aExtAddress->m8,
-	};
-	uint8_t header_ie_buf[OT_ACK_IE_MAX_SIZE];
-	int result;
-
-	ARG_UNUSED(aInstance);
-
-	set_vendor_ie_header_lm(aLinkMetrics.mLqi, aLinkMetrics.mLinkMargin,
-				aLinkMetrics.mRssi, header_ie_buf);
-	config.ack_ie.header_ie = (struct ieee802154_header_ie *)header_ie_buf;
-	result = radio_api->configure(radio_dev, IEEE802154_CONFIG_ENH_ACK_HEADER_IE, &config);
-
-	return result ? OT_ERROR_FAILED : OT_ERROR_NONE;
-}
-
-#endif /* CONFIG_OPENTHREAD_LINK_METRICS_SUBJECT */
-
-otError otPlatRadioSetChannelMaxTransmitPower(otInstance *aInstance, uint8_t aChannel,
-					      int8_t aMaxPower)
-{
-	ARG_UNUSED(aInstance);
-
-	if (aChannel < OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN ||
-	    aChannel > OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MAX) {
-		return OT_ERROR_INVALID_ARGS;
-	}
-
-	max_tx_power_table[aChannel - OT_RADIO_2P4GHZ_OQPSK_CHANNEL_MIN] = aMaxPower;
-
-	if (aChannel == channel) {
-		radio_api->set_txpower(radio_dev, get_transmit_power_for_channel(aChannel));
-	}
-
-	return OT_ERROR_NONE;
-}
+NET_DEVICE_INIT(dectnr_openthread_l2, "dectnr_openthread_l2",
+		dectnr_dev_init, NULL,
+		&dectnr_l2_ctx, NULL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
+		&dectnr_radio_api, L2_LAYER, L2_CTX_TYPE, OPENTHREAD_MTU);
