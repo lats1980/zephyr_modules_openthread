@@ -1,0 +1,2 @@
+config OPENTHREAD_RADIO_LINK_DECT_NR_PHY
+	bool "Support for IEEE802.15.4 over DECT NR+ radio link"
