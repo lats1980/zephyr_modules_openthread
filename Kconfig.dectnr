@@ -1,2 +1,11 @@
 config OPENTHREAD_RADIO_LINK_DECT_NR_PHY
 	bool "Support for IEEE802.15.4 over DECT NR+ radio link"
+	select NRF_MODEM_LIB
+	select HWINFO
+
+config OPENTHREAD_RADIO_LINK_DECT_NR_PHY_FREQUENCY
+	int "Openthread DECT NR PHY frequency"
+	default 1677
+	help
+	  The absolute channel frequency number for the transmission.
+	  See 5.4.2 of DECT-SPEC "DECT-2020 NR Part 2".
