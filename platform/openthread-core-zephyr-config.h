@@ -14,6 +14,7 @@
 #define OPENTHREAD_CORE_ZEPHYR_CONFIG_H_
 
 #include <zephyr/devicetree.h>
+#include <zephyr/psa/key_ids.h>
 #include <zephyr/toolchain.h>
 
 /**
@@ -211,8 +212,9 @@
  *
  */
 #define OPENTHREAD_CONFIG_PLATFORM_USEC_TIMER_ENABLE                                               \
-	(CONFIG_OPENTHREAD_CSL_RECEIVER &&                                                         \
-	 (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2))
+	((CONFIG_OPENTHREAD_CSL_RECEIVER &&                                                        \
+	  (OPENTHREAD_CONFIG_THREAD_VERSION >= OT_THREAD_VERSION_1_2)) ||                          \
+	 CONFIG_OPENTHREAD_WAKEUP_END_DEVICE)
 
 /* Zephyr does not use OpenThread's heap. mbedTLS will use heap memory allocated
  * by Zephyr. Here, we use some dummy values to prevent OpenThread warnings.
@@ -282,6 +284,16 @@
  *
  */
 #define RADIO_CONFIG_SRC_MATCH_EXT_ENTRY_NUM 0
+
+/**
+ * @def OPENTHREAD_CONFIG_MAC_CSL_REQUEST_AHEAD_US
+ *
+ * Define how many microseconds ahead should MAC deliver CSL frame to SubMac.
+ *
+ */
+#ifdef CONFIG_OPENTHREAD_CSL_REQUEST_TIME_AHEAD
+#define OPENTHREAD_CONFIG_MAC_CSL_REQUEST_AHEAD_US CONFIG_OPENTHREAD_CSL_REQUEST_TIME_AHEAD
+#endif /* CONFIG_OPENTHREAD_CSL_REQUEST_TIME_AHEAD */
 
 /**
  * @def OPENTHREAD_CONFIG_CSL_RECEIVE_TIME_AHEAD
@@ -498,5 +510,13 @@
 #ifdef CONFIG_OPENTHREAD_MLE_CHILD_TIMEOUT
 #define OPENTHREAD_CONFIG_MLE_CHILD_TIMEOUT_DEFAULT CONFIG_OPENTHREAD_MLE_CHILD_TIMEOUT
 #endif
+
+/**
+ * @def OPENTHREAD_CONFIG_PSA_ITS_NVM_OFFSET
+ *
+ * NVM offset while using key refs.
+ *
+ */
+#define OPENTHREAD_CONFIG_PSA_ITS_NVM_OFFSET ZEPHYR_PSA_OPENTHREAD_KEY_ID_RANGE_BEGIN
 
 #endif  /* OPENTHREAD_CORE_ZEPHYR_CONFIG_H_ */
